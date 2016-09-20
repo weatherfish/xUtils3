@@ -24,7 +24,7 @@ import org.xutils.db.table.DbModel;
 import org.xutils.db.table.TableEntity;
 import org.xutils.ex.DbException;
 
-import java.util.LinkedList;
+import java.util.ArrayList;
 import java.util.List;
 
 /**
@@ -162,7 +162,7 @@ public final class DbModelSelector {
         Cursor cursor = table.getDb().execQuery(this.toString());
         if (cursor != null) {
             try {
-                result = new LinkedList<DbModel>();
+                result = new ArrayList<DbModel>();
                 while (cursor.moveToNext()) {
                     DbModel entity = CursorUtils.getDbModel(cursor);
                     result.add(entity);
@@ -193,7 +193,7 @@ public final class DbModelSelector {
                 result.append("*");
             }
         }
-        result.append(" FROM ").append("\"").append(selector.getTable().getTableName()).append("\"");
+        result.append(" FROM ").append("\"").append(selector.getTable().getName()).append("\"");
         WhereBuilder whereBuilder = selector.getWhereBuilder();
         if (whereBuilder != null && whereBuilder.getWhereItemSize() > 0) {
             result.append(" WHERE ").append(whereBuilder.toString());

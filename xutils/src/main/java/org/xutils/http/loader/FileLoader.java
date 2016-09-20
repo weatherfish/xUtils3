@@ -7,7 +7,9 @@ import org.xutils.cache.DiskCacheFile;
 import org.xutils.cache.LruDiskCache;
 import org.xutils.common.Callback;
 import org.xutils.common.util.IOUtil;
+import org.xutils.common.util.LogUtil;
 import org.xutils.common.util.ProcessLock;
+import org.xutils.ex.FileLockedException;
 import org.xutils.ex.HttpException;
 import org.xutils.http.RequestParams;
 import org.xutils.http.request.UriRequest;
@@ -19,6 +21,8 @@ import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.UnsupportedEncodingException;
+import java.net.URLDecoder;
 import java.util.Arrays;
 import java.util.Date;
 
@@ -37,7 +41,6 @@ import java.util.Date;
 public class FileLoader extends Loader<File> {
 
     private static final int CHECK_SIZE = 512;
-    private static final int LOCK_WAIT = 1000 * 3; // 3s
 
     private String tempSaveFilePath;
     private String saveFilePath;
@@ -69,6 +72,10 @@ public class FileLoader extends Loader<File> {
         BufferedOutputStream bos = null;
         try {
             targetFile = new File(tempSaveFilePath);
+            if (targetFile.isDirectory()) {
+                // 防止文件正在写入时, 父文件夹被删除, 继续写入时造成偶现文件节点异常问题.
+                IOUtil.deleteFileOrDir(targetFile);
+            }
             if (!targetFile.exists()) {
                 File dir = targetFile.getParentFile();
                 if (dir.exists() || dir.mkdirs()) {
@@ -90,6 +97,8 @@ public class FileLoader extends Loader<File> {
                             IOUtil.closeQuietly(fis); // 先关闭文件流, 否则文件删除会失败.
                             IOUtil.deleteFileOrDir(targetFile);
                             throw new RuntimeException("need retry");
+                        } else {
+                            contentLength -= CHECK_SIZE;
                         }
                     } else {
                         IOUtil.deleteFileOrDir(targetFile);
@@ -151,19 +160,7 @@ public class FileLoader extends Loader<File> {
             IOUtil.closeQuietly(bos);
         }
 
-        // 处理[下载逻辑2.b](见文件头doc)
-        if (isAutoRename && targetFile.exists() && !TextUtils.isEmpty(responseFileName)) {
-            File newFile = new File(targetFile.getParent(), responseFileName);
-            while (newFile.exists()) {
-                newFile = new File(targetFile.getParent(), System.currentTimeMillis() + responseFileName);
-            }
-            return targetFile.renameTo(newFile) ? newFile : targetFile;
-        } else if (!saveFilePath.equals(tempSaveFilePath)) {
-            File newFile = new File(saveFilePath);
-            return targetFile.renameTo(newFile) ? newFile : targetFile;
-        } else {
-            return targetFile;
-        }
+        return autoRename(targetFile);
     }
 
     @Override
@@ -192,9 +189,9 @@ public class FileLoader extends Loader<File> {
             }
 
             // 等待, 若不能下载则取消此次下载.
-            processLock = ProcessLock.tryLock(saveFilePath + "_lock", true, LOCK_WAIT);
+            processLock = ProcessLock.tryLock(saveFilePath + "_lock", true);
             if (processLock == null || !processLock.isValid()) {
-                throw new Callback.CancelledException("download exists: " + saveFilePath);
+                throw new FileLockedException("download exists: " + saveFilePath);
             }
 
             params = request.getParams();
@@ -211,14 +208,14 @@ public class FileLoader extends Loader<File> {
                     }
                 }
                 // retry 时需要覆盖RANGE参数
-                params.addHeader("RANGE", "bytes=" + range + "-");
+                params.setHeader("RANGE", "bytes=" + range + "-");
             }
 
             if (progressHandler != null && !progressHandler.updateProgress(0, 0, false)) {
                 throw new Callback.CancelledException("download stopped!");
             }
 
-            request.sendRequest();
+            request.sendRequest(); // may be throw an HttpException
 
             contentLength = request.getContentLength();
             if (isAutoRename) {
@@ -241,15 +238,18 @@ public class FileLoader extends Loader<File> {
             }
             result = this.load(request.getInputStream());
         } catch (HttpException httpException) {
-            if (httpException.getExceptionCode() == 416) {
-                if (saveFilePath != null) {
-                    result = new File(saveFilePath);
+            if (httpException.getCode() == 416) {
+                if (diskCacheFile != null) {
+                    result = diskCacheFile.commit();
                 } else {
-                    result = LruDiskCache.getDiskCache(params.getCacheDirName()).getDiskCacheFile(request.getCacheKey());
+                    result = new File(tempSaveFilePath);
                 }
                 // 从缓存获取文件, 不rename和断点, 直接退出.
                 if (result != null && result.exists()) {
-                    return result;
+                    if (isAutoRename) {
+                        responseFileName = getResponseFileName(request);
+                    }
+                    result = autoRename(result);
                 } else {
                     IOUtil.deleteFileOrDir(result);
                     throw new IllegalStateException("cache file not found" + request.getCacheKey());
@@ -272,12 +272,28 @@ public class FileLoader extends Loader<File> {
         diskCacheFile = LruDiskCache.getDiskCache(params.getCacheDirName()).createDiskCacheFile(entity);
 
         if (diskCacheFile != null) {
-            saveFilePath = diskCacheFile.getPath();
+            saveFilePath = diskCacheFile.getAbsolutePath();
             // diskCacheFile is a temp path, diskCacheFile.commit() return the dest file.
             tempSaveFilePath = saveFilePath;
             isAutoRename = false;
         } else {
             throw new IOException("create cache file error:" + request.getCacheKey());
+        }
+    }
+
+    // 处理[下载逻辑2.b](见文件头doc)
+    private File autoRename(File loadedFile) {
+        if (isAutoRename && loadedFile.exists() && !TextUtils.isEmpty(responseFileName)) {
+            File newFile = new File(loadedFile.getParent(), responseFileName);
+            while (newFile.exists()) {
+                newFile = new File(loadedFile.getParent(), System.currentTimeMillis() + responseFileName);
+            }
+            return loadedFile.renameTo(newFile) ? newFile : loadedFile;
+        } else if (!saveFilePath.equals(tempSaveFilePath)) {
+            File newFile = new File(saveFilePath);
+            return loadedFile.renameTo(newFile) ? newFile : loadedFile;
+        } else {
+            return loadedFile;
         }
     }
 
@@ -292,7 +308,19 @@ public class FileLoader extends Loader<File> {
                 if (endIndex < 0) {
                     endIndex = disposition.length();
                 }
-                return disposition.substring(startIndex, endIndex);
+                if (endIndex > startIndex) {
+                    try {
+                        String name = URLDecoder.decode(
+                                disposition.substring(startIndex, endIndex),
+                                request.getParams().getCharset());
+                        if (name.startsWith("\"") && name.endsWith("\"")) {
+                            name = name.substring(1, name.length() - 1);
+                        }
+                        return name;
+                    } catch (UnsupportedEncodingException ex) {
+                        LogUtil.e(ex.getMessage(), ex);
+                    }
+                }
             }
         }
         return null;

@@ -4,6 +4,8 @@ package org.xutils.http.body;
 import android.text.TextUtils;
 
 import org.xutils.common.Callback;
+import org.xutils.common.util.IOUtil;
+import org.xutils.common.util.KeyValue;
 import org.xutils.http.ProgressHandler;
 
 import java.io.File;
@@ -11,7 +13,9 @@ import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
-import java.util.Map;
+import java.io.UnsupportedEncodingException;
+import java.util.List;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Author: wyouflf
@@ -23,23 +27,25 @@ public class MultipartBody implements ProgressBody {
     private static byte[] END_BYTES = "\r\n".getBytes();
     private static byte[] TWO_DASHES_BYTES = "--".getBytes();
     private byte[] boundaryPostfixBytes;
-    private String contentType;
-    private String charset;
+    private String contentType; // multipart/subtype; boundary=xxx...
+    private String charset = "UTF-8";
 
-    private Map<String, Object> multipartParams;
+    private List<KeyValue> multipartParams;
     private long total = 0;
     private long current = 0;
 
-    public MultipartBody(Map<String, Object> multipartParams, String charset) {
+    public MultipartBody(List<KeyValue> multipartParams, String charset) {
+        if (!TextUtils.isEmpty(charset)) {
+            this.charset = charset;
+        }
         this.multipartParams = multipartParams;
-        this.charset = charset;
         generateContentType();
 
         // calc total
         CounterOutputStream counter = new CounterOutputStream();
         try {
             this.writeTo(counter);
-            this.total = counter.total;
+            this.total = counter.total.get();
         } catch (IOException e) {
             this.total = -1;
         }
@@ -63,6 +69,18 @@ public class MultipartBody implements ProgressBody {
         return total;
     }
 
+    /**
+     * only change subType:
+     * "multipart/subType; boundary=xxx..."
+     *
+     * @param subType "form-data" or "related"
+     */
+    @Override
+    public void setContentType(String subType) {
+        int index = contentType.indexOf(";");
+        this.contentType = "multipart/" + subType + contentType.substring(index);
+    }
+
     @Override
     public String getContentType() {
         return contentType;
@@ -75,13 +93,11 @@ public class MultipartBody implements ProgressBody {
             throw new Callback.CancelledException("upload stopped!");
         }
 
-        for (Map.Entry<String, Object> kv : multipartParams.entrySet()) {
-            String name = kv.getKey();
-            Object value = kv.getValue();
+        for (KeyValue kv : multipartParams) {
+            String name = kv.key;
+            Object value = kv.value;
             if (!TextUtils.isEmpty(name) && value != null) {
-                if (!writeEntry(out, name, value, charset, boundaryPostfixBytes)) {
-                    throw new Callback.CancelledException("upload stopped!");
-                }
+                writeEntry(out, name, value);
             }
         }
         writeLine(out, TWO_DASHES_BYTES, BOUNDARY_PREFIX_BYTES, boundaryPostfixBytes, TWO_DASHES_BYTES);
@@ -92,54 +108,60 @@ public class MultipartBody implements ProgressBody {
         }
     }
 
-    private boolean writeEntry(OutputStream out,
-                               String name, Object value,
-                               String charset, byte[] boundaryPostfixBytes) throws IOException {
+    /**
+     * 写入multipart中的一项
+     *
+     * @param out
+     * @param name
+     * @param value
+     * @throws IOException
+     */
+    private void writeEntry(OutputStream out, String name, Object value) throws IOException {
         writeLine(out, TWO_DASHES_BYTES, BOUNDARY_PREFIX_BYTES, boundaryPostfixBytes);
+
+        String fileName = "";
+        String contentType = null;
+        if (value instanceof BodyItemWrapper) {
+            BodyItemWrapper wrapper = (BodyItemWrapper) value;
+            value = wrapper.getValue();
+            fileName = wrapper.getFileName();
+            contentType = wrapper.getContentType();
+        }
+
         if (value instanceof File) {
             File file = (File) value;
-            String filename = file.getName();
-            String contentType = FileBody.getFileContentType(file);
-            writeLine(out, ("Content-Disposition: form-data; name=\""
-                    + name.replace("\"", "%22") + "\"; filename=\""
-                    + filename.replace("\"", "%22") + "\"").getBytes());
-            writeLine(out, ("Content-Type: " + contentType).getBytes());
-            writeLine(out); // 内容前空一行
-            if (!writeStreamAndCloseIn(out, new FileInputStream(file))) {
-                return false;
+            if (TextUtils.isEmpty(fileName)) {
+                fileName = file.getName();
             }
+            if (TextUtils.isEmpty(contentType)) {
+                contentType = FileBody.getFileContentType(file);
+            }
+            writeLine(out, buildContentDisposition(name, fileName, charset));
+            writeLine(out, buildContentType(value, contentType, charset));
+            writeLine(out); // 内容前空一行
+            writeFile(out, file);
+            writeLine(out);
         } else {
-            writeLine(out, ("Content-Disposition: form-data; name=\""
-                    + name.replace("\"", "%22") + "\"").getBytes());
+            writeLine(out, buildContentDisposition(name, fileName, charset));
+            writeLine(out, buildContentType(value, contentType, charset));
+            writeLine(out); // 内容前空一行
             if (value instanceof InputStream) {
-                if (value instanceof ContentTypeInputStream) {
-                    ContentTypeInputStream wIn = (ContentTypeInputStream) value;
-                    value = wIn.getBase();
-                    String contentType = wIn.getContentType();
-                    writeLine(out, ("Content-Type: " + contentType).getBytes());
-                }
-                writeLine(out); // 内容前空一行
-                if (!writeStreamAndCloseIn(out, (InputStream) value)) {
-                    return false;
-                }
+                writeStreamAndCloseIn(out, (InputStream) value);
+                writeLine(out);
             } else {
                 byte[] content;
                 if (value instanceof byte[]) {
                     content = (byte[]) value;
                 } else {
-                    writeLine(out, ("Content-Type:text/plain; charset:" + charset).getBytes());
                     content = String.valueOf(value).getBytes(charset);
                 }
-                writeLine(out); // 内容前空一行
                 writeLine(out, content);
                 current += content.length;
                 if (callBackHandler != null && !callBackHandler.updateProgress(total, current, false)) {
-                    return false;
+                    throw new Callback.CancelledException("upload stopped!");
                 }
             }
         }
-
-        return true;
     }
 
     private void writeLine(OutputStream out, byte[]... bs) throws IOException {
@@ -151,41 +173,96 @@ public class MultipartBody implements ProgressBody {
         out.write(END_BYTES);
     }
 
-    private boolean writeStreamAndCloseIn(OutputStream out, InputStream in) throws IOException {
-        byte[] buf = new byte[1024];
-        int len;
-        while ((len = in.read(buf)) >= 0) {
-            out.write(buf, 0, len);
-            current += len;
-            if (callBackHandler != null && !callBackHandler.updateProgress(total, current, false)) {
-                return false;
+    private void writeFile(OutputStream out, File file) throws IOException {
+        if (out instanceof CounterOutputStream) {
+            ((CounterOutputStream) out).addFile(file);
+        } else {
+            writeStreamAndCloseIn(out, new FileInputStream(file));
+        }
+    }
+
+    private void writeStreamAndCloseIn(OutputStream out, InputStream in) throws IOException {
+        if (out instanceof CounterOutputStream) {
+            ((CounterOutputStream) out).addStream(in);
+        } else {
+            try {
+                int len;
+                byte[] buf = new byte[1024];
+                while ((len = in.read(buf)) >= 0) {
+                    out.write(buf, 0, len);
+                    current += len;
+                    if (callBackHandler != null && !callBackHandler.updateProgress(total, current, false)) {
+                        throw new Callback.CancelledException("upload stopped!");
+                    }
+                }
+            } finally {
+                IOUtil.closeQuietly(in);
             }
         }
-        in.close();
-        out.write(END_BYTES);
-        return true;
+    }
+
+    private static byte[] buildContentDisposition(String name, String fileName, String charset) throws UnsupportedEncodingException {
+        StringBuilder result = new StringBuilder("Content-Disposition: form-data");
+        result.append("; name=\"").append(name.replace("\"", "\\\"")).append("\"");
+        if (!TextUtils.isEmpty(fileName)) {
+            result.append("; filename=\"").append(fileName.replace("\"", "\\\"")).append("\"");
+        }
+        return result.toString().getBytes(charset);
+    }
+
+    private static byte[] buildContentType(Object value, String contentType, String charset) throws UnsupportedEncodingException {
+        StringBuilder result = new StringBuilder("Content-Type: ");
+        if (TextUtils.isEmpty(contentType)) {
+            if (value instanceof String) {
+                contentType = "text/plain; charset=" + charset;
+            } else {
+                contentType = "application/octet-stream";
+            }
+        } else {
+            contentType = contentType.replaceFirst("\\/jpg$", "/jpeg");
+        }
+        result.append(contentType);
+        return result.toString().getBytes(charset);
     }
 
     private class CounterOutputStream extends OutputStream {
 
-        long total = 0;
+        final AtomicLong total = new AtomicLong(0L);
 
         public CounterOutputStream() {
         }
 
+        public void addFile(File file) {
+            if (total.get() == -1L) return;
+            total.addAndGet(file.length());
+        }
+
+        public void addStream(InputStream inputStream) {
+            if (total.get() == -1L) return;
+            long length = InputStreamBody.getInputStreamLength(inputStream);
+            if (length > 0) {
+                total.addAndGet(length);
+            } else {
+                total.set(-1L);
+            }
+        }
+
         @Override
         public void write(int oneByte) throws IOException {
-            total++;
+            if (total.get() == -1L) return;
+            total.incrementAndGet();
         }
 
         @Override
         public void write(byte[] buffer) throws IOException {
-            total += buffer.length;
+            if (total.get() == -1L) return;
+            total.addAndGet(buffer.length);
         }
 
         @Override
         public void write(byte[] buffer, int offset, int count) throws IOException {
-            total += count;
+            if (total.get() == -1L) return;
+            total.addAndGet(count);
         }
     }
 }

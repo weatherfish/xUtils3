@@ -8,11 +8,13 @@ import android.widget.ImageView;
 
 import org.xutils.common.util.DensityUtil;
 import org.xutils.common.util.LogUtil;
+import org.xutils.http.RequestParams;
 
 import java.lang.reflect.Field;
 
 /**
  * Created by wyouflf on 15/8/21.
+ * 图片加载参数
  */
 public class ImageOptions {
 
@@ -50,6 +52,9 @@ public class ImageOptions {
     private Animation animation = null;
     // end region ############ display options
 
+    // extends
+    private boolean useMemCache = true;
+    private ParamsBuilder paramsBuilder;
 
     protected ImageOptions() {
     }
@@ -210,6 +215,14 @@ public class ImageOptions {
         return forceLoadingDrawable;
     }
 
+    public boolean isUseMemCache() {
+        return useMemCache;
+    }
+
+    public ParamsBuilder getParamsBuilder() {
+        return paramsBuilder;
+    }
+
     @Override
     public boolean equals(Object o) {
         if (this == o) return true;
@@ -275,6 +288,9 @@ public class ImageOptions {
         return value;
     }
 
+    public interface ParamsBuilder {
+        RequestParams buildParams(RequestParams params, ImageOptions options);
+    }
 
     public static class Builder {
 
@@ -382,6 +398,16 @@ public class ImageOptions {
 
         public Builder setForceLoadingDrawable(boolean forceLoadingDrawable) {
             options.forceLoadingDrawable = forceLoadingDrawable;
+            return this;
+        }
+
+        public Builder setUseMemCache(boolean useMemCache) {
+            options.useMemCache = useMemCache;
+            return this;
+        }
+
+        public Builder setParamsBuilder(ParamsBuilder paramsBuilder) {
+            options.paramsBuilder = paramsBuilder;
             return this;
         }
     }

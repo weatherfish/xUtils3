@@ -1,5 +1,7 @@
 package org.xutils.http;
 
+import android.text.TextUtils;
+
 import org.xutils.common.Callback;
 import org.xutils.common.task.AbsTask;
 import org.xutils.common.task.Priority;
@@ -7,15 +9,23 @@ import org.xutils.common.task.PriorityExecutor;
 import org.xutils.common.util.IOUtil;
 import org.xutils.common.util.LogUtil;
 import org.xutils.common.util.ParameterizedTypeUtil;
+import org.xutils.ex.HttpException;
+import org.xutils.ex.HttpRedirectException;
+import org.xutils.http.app.HttpRetryHandler;
+import org.xutils.http.app.RedirectHandler;
+import org.xutils.http.app.RequestInterceptListener;
 import org.xutils.http.app.RequestTracker;
 import org.xutils.http.request.UriRequest;
 import org.xutils.http.request.UriRequestFactory;
+import org.xutils.x;
 
 import java.io.Closeable;
 import java.io.File;
-import java.lang.reflect.ParameterizedType;
+import java.lang.ref.WeakReference;
 import java.lang.reflect.Type;
-import java.lang.reflect.TypeVariable;
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.Map;
 import java.util.concurrent.Executor;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -26,21 +36,23 @@ import java.util.concurrent.atomic.AtomicInteger;
 public class HttpTask<ResultType> extends AbsTask<ResultType> implements ProgressHandler {
 
     // 请求相关
+    private RequestParams params;
     private UriRequest request;
     private RequestWorker requestWorker;
-    private final RequestParams params;
     private final Executor executor;
+    private volatile boolean hasException = false;
     private final Callback.CommonCallback<ResultType> callback;
 
     // 缓存控制
     private Object rawResult = null;
-    private final Object cacheLock = new Object();
     private volatile Boolean trustCache = null;
+    private final Object cacheLock = new Object();
 
     // 扩展callback
     private Callback.CacheCallback<ResultType> cacheCallback;
     private Callback.PrepareCallback prepareCallback;
     private Callback.ProgressCallback progressCallback;
+    private RequestInterceptListener requestInterceptListener;
 
     // 日志追踪
     private RequestTracker tracker;
@@ -50,8 +62,12 @@ public class HttpTask<ResultType> extends AbsTask<ResultType> implements Progres
     private final static int MAX_FILE_LOAD_WORKER = 3;
     private final static AtomicInteger sCurrFileLoadCount = new AtomicInteger(0);
 
-    private static final PriorityExecutor HTTP_EXECUTOR = new PriorityExecutor(5);
-    private static final PriorityExecutor CACHE_EXECUTOR = new PriorityExecutor(5);
+    // 文件下载任务
+    private static final HashMap<String, WeakReference<HttpTask<?>>>
+            DOWNLOAD_TASK = new HashMap<String, WeakReference<HttpTask<?>>>(1);
+
+    private static final PriorityExecutor HTTP_EXECUTOR = new PriorityExecutor(5, true);
+    private static final PriorityExecutor CACHE_EXECUTOR = new PriorityExecutor(5, true);
 
 
     public HttpTask(RequestParams params, Callback.Cancelable cancelHandler,
@@ -73,6 +89,24 @@ public class HttpTask<ResultType> extends AbsTask<ResultType> implements Progres
         if (callback instanceof Callback.ProgressCallback) {
             this.progressCallback = (Callback.ProgressCallback<ResultType>) callback;
         }
+        if (callback instanceof RequestInterceptListener) {
+            this.requestInterceptListener = (RequestInterceptListener) callback;
+        }
+
+        // init tracker
+        {
+            RequestTracker customTracker = params.getRequestTracker();
+            if (customTracker == null) {
+                if (callback instanceof RequestTracker) {
+                    customTracker = (RequestTracker) callback;
+                } else {
+                    customTracker = UriRequestFactory.getDefaultTracker();
+                }
+            }
+            if (customTracker != null) {
+                tracker = new RequestTrackerWrapper(customTracker);
+            }
+        }
 
         // init executor
         if (params.getExecutor() != null) {
@@ -86,46 +120,69 @@ public class HttpTask<ResultType> extends AbsTask<ResultType> implements Progres
         }
     }
 
-    // 初始化请求参数
-    private UriRequest initRequest() throws Throwable {
-        // get loadType
+    // 解析loadType
+    private void resolveLoadType() {
         Class<?> callBackType = callback.getClass();
         if (callback instanceof Callback.TypedCallback) {
-            loadType = ((Callback.TypedCallback) callback).getResultType();
+            loadType = ((Callback.TypedCallback) callback).getLoadType();
         } else if (callback instanceof Callback.PrepareCallback) {
             loadType = ParameterizedTypeUtil.getParameterizedType(callBackType, Callback.PrepareCallback.class, 0);
         } else {
             loadType = ParameterizedTypeUtil.getParameterizedType(callBackType, Callback.CommonCallback.class, 0);
         }
+    }
 
-        // check loadType & resultType
-        {
-            if (loadType instanceof ParameterizedType) {
-                loadType = ((ParameterizedType) loadType).getRawType();
-            } else if (loadType instanceof TypeVariable) {
-                throw new IllegalArgumentException(
-                        "not support callback type" + callBackType.getCanonicalName());
-            }
-        }
-
+    // 初始化请求参数
+    private UriRequest createNewRequest() throws Throwable {
         // init request
         params.init();
-        UriRequest result = UriRequestFactory.getUriRequest(params, (Class<?>) loadType);
-        result.setCallingClassLoader(callBackType.getClassLoader());
+        UriRequest result = UriRequestFactory.getUriRequest(params, loadType);
+        result.setCallingClassLoader(callback.getClass().getClassLoader());
         result.setProgressHandler(this);
-
-        // init tracker
-        RequestTracker customTracker = null;
-        if (callback instanceof RequestTracker) {
-            customTracker = (RequestTracker) callback;
-        } else {
-            customTracker = result.getResponseTracker();
-        }
-        if (customTracker != null) {
-            tracker = new RequestTrackerWrapper(customTracker);
-        }
-
+        this.loadingUpdateMaxTimeSpan = params.getLoadingUpdateMaxTimeSpan();
+        this.update(FLAG_REQUEST_CREATED, result);
         return result;
+    }
+
+    // 文件下载冲突检测
+    private void checkDownloadTask() {
+        if (File.class == loadType) {
+            synchronized (DOWNLOAD_TASK) {
+                String downloadTaskKey = this.params.getSaveFilePath();
+                /*{
+                    // 不处理缓存文件下载冲突,
+                    // 缓存文件下载冲突会抛出FileLockedException异常,
+                    // 使用异常处理控制是否重新尝试下载.
+                    if (TextUtils.isEmpty(downloadTaskKey)) {
+                        downloadTaskKey = this.request.getCacheKey();
+                    }
+                }*/
+                if (!TextUtils.isEmpty(downloadTaskKey)) {
+                    WeakReference<HttpTask<?>> taskRef = DOWNLOAD_TASK.get(downloadTaskKey);
+                    if (taskRef != null) {
+                        HttpTask<?> task = taskRef.get();
+                        if (task != null) {
+                            task.cancel();
+                            task.closeRequestSync();
+                        }
+                        DOWNLOAD_TASK.remove(downloadTaskKey);
+                    }
+                    DOWNLOAD_TASK.put(downloadTaskKey, new WeakReference<HttpTask<?>>(this));
+                } // end if (!TextUtils.isEmpty(downloadTaskKey))
+
+                if (DOWNLOAD_TASK.size() > MAX_FILE_LOAD_WORKER) {
+                    Iterator<Map.Entry<String, WeakReference<HttpTask<?>>>>
+                            entryItr = DOWNLOAD_TASK.entrySet().iterator();
+                    while (entryItr.hasNext()) {
+                        Map.Entry<String, WeakReference<HttpTask<?>>> next = entryItr.next();
+                        WeakReference<HttpTask<?>> value = next.getValue();
+                        if (value == null || value.get() == null) {
+                            entryItr.remove();
+                        }
+                    }
+                }
+            } // end synchronized
+        }
     }
 
     @Override
@@ -138,11 +195,18 @@ public class HttpTask<ResultType> extends AbsTask<ResultType> implements Progres
 
         // 初始化请求参数
         ResultType result = null;
+        resolveLoadType();
+        request = createNewRequest();
+        checkDownloadTask();
+        // retry 初始化
         boolean retry = true;
         int retryCount = 0;
         Throwable exception = null;
-        HttpRetryHandler retryHandler = new HttpRetryHandler(this.params.getMaxRetryCount());
-        request = initRequest();
+        HttpRetryHandler retryHandler = this.params.getHttpRetryHandler();
+        if (retryHandler == null) {
+            retryHandler = new HttpRetryHandler();
+        }
+        retryHandler.setMaxRetryCount(this.params.getMaxRetryCount());
 
         if (this.isCancelled()) {
             throw new Callback.CancelledException("cancelled before request");
@@ -152,16 +216,12 @@ public class HttpTask<ResultType> extends AbsTask<ResultType> implements Progres
         Object cacheResult = null;
         if (cacheCallback != null && HttpMethod.permitsCache(params.getMethod())) {
             // 尝试从缓存获取结果, 并为请求头加入缓存控制参数.
-            while (retry) {
-                try {
-                    clearRawResult();
-                    rawResult = this.request.loadResultFromCache();
-                    break;
-                } catch (Throwable ex) {
-                    LogUtil.w("load disk cache error", ex);
-                    exception = ex;
-                    retry = retryHandler.retryRequest(ex, ++retryCount, this.request);
-                }
+            try {
+                clearRawResult();
+                LogUtil.d("load cache: " + this.request.getRequestUri());
+                rawResult = this.request.loadResultFromCache();
+            } catch (Throwable ex) {
+                LogUtil.w("load disk cache error", ex);
             }
 
             if (this.isCancelled()) {
@@ -194,6 +254,8 @@ public class HttpTask<ResultType> extends AbsTask<ResultType> implements Progres
                         synchronized (cacheLock) {
                             try {
                                 cacheLock.wait();
+                            } catch (InterruptedException iex) {
+                                throw new Callback.CancelledException("cancelled before request");
                             } catch (Throwable ignored) {
                             }
                         }
@@ -215,9 +277,17 @@ public class HttpTask<ResultType> extends AbsTask<ResultType> implements Progres
             this.request.clearCacheHeader();
         }
 
+        // 判断请求的缓存策略
+        if (callback instanceof Callback.ProxyCacheCallback) {
+            if (((Callback.ProxyCacheCallback) callback).onlyCache()) {
+                return null;
+            }
+        }
+
         // 发起请求
         retry = true;
         while (retry) {
+            retry = false;
 
             try {
                 if (this.isCancelled()) {
@@ -229,13 +299,10 @@ public class HttpTask<ResultType> extends AbsTask<ResultType> implements Progres
 
                 try {
                     clearRawResult();
-                    requestWorker = new RequestWorker(this.request, this.loadType);
-                    if (params.isCancelFast()) {
-                        requestWorker.start();
-                        requestWorker.join();
-                    } else {
-                        requestWorker.run();
-                    }
+                    // 开始请求工作
+                    LogUtil.d("load: " + this.request.getRequestUri());
+                    requestWorker = new RequestWorker();
+                    requestWorker.request();
                     if (requestWorker.ex != null) {
                         throw requestWorker.ex;
                     }
@@ -250,6 +317,11 @@ public class HttpTask<ResultType> extends AbsTask<ResultType> implements Progres
                 }
 
                 if (prepareCallback != null) {
+
+                    if (this.isCancelled()) {
+                        throw new Callback.CancelledException("cancelled before request");
+                    }
+
                     try {
                         result = (ResultType) prepareCallback.prepare(rawResult);
                     } finally {
@@ -264,43 +336,60 @@ public class HttpTask<ResultType> extends AbsTask<ResultType> implements Progres
                     this.request.save2Cache();
                 }
 
-                retry = false;
-
                 if (this.isCancelled()) {
                     throw new Callback.CancelledException("cancelled after request");
                 }
+            } catch (HttpRedirectException redirectEx) {
+                retry = true;
+                LogUtil.w("Http Redirect:" + params.getUri());
             } catch (Throwable ex) {
-                if (this.request.getResponseCode() == 304) { // disk cache is valid.
-                    return null;
-                } else {
-                    exception = ex;
-                    retry = retryHandler.retryRequest(ex, ++retryCount, this.request);
+                switch (this.request.getResponseCode()) {
+                    case 204: // empty content
+                    case 205: // empty content
+                    case 304: // disk cache is valid.
+                        return null;
+                    default: {
+                        exception = ex;
+                        if (this.isCancelled() && !(exception instanceof Callback.CancelledException)) {
+                            exception = new Callback.CancelledException("canceled by user");
+                        }
+                        retry = retryHandler.canRetry(this.request, exception, ++retryCount);
+                    }
                 }
             }
 
         }
 
         if (exception != null && result == null && !trustCache) {
+            hasException = true;
             throw exception;
         }
 
         return result;
     }
 
-    private static final int FLAG_CACHE = 1;
-    private static final int FLAG_PROGRESS = 2;
+    private static final int FLAG_REQUEST_CREATED = 1;
+    private static final int FLAG_CACHE = 2;
+    private static final int FLAG_PROGRESS = 3;
 
     @Override
     @SuppressWarnings("unchecked")
     protected void onUpdate(int flag, Object... args) {
         switch (flag) {
+            case FLAG_REQUEST_CREATED: {
+                if (this.tracker != null) {
+                    this.tracker.onRequestCreated((UriRequest) args[0]);
+                }
+                break;
+            }
             case FLAG_CACHE: {
                 synchronized (cacheLock) {
                     try {
+                        ResultType result = (ResultType) args[0];
                         if (tracker != null) {
-                            tracker.onCache(request);
+                            tracker.onCache(request, result);
                         }
-                        trustCache = this.cacheCallback.onCache((ResultType) args[0]);
+                        trustCache = this.cacheCallback.onCache(result);
                     } catch (Throwable ex) {
                         trustCache = false;
                         callback.onError(ex, true);
@@ -308,6 +397,7 @@ public class HttpTask<ResultType> extends AbsTask<ResultType> implements Progres
                         cacheLock.notifyAll();
                     }
                 }
+                break;
             }
             case FLAG_PROGRESS: {
                 if (this.progressCallback != null && args.length == 3) {
@@ -320,6 +410,7 @@ public class HttpTask<ResultType> extends AbsTask<ResultType> implements Progres
                         callback.onError(ex, true);
                     }
                 }
+                break;
             }
             default: {
                 break;
@@ -330,7 +421,7 @@ public class HttpTask<ResultType> extends AbsTask<ResultType> implements Progres
     @Override
     protected void onWaiting() {
         if (tracker != null) {
-            tracker.onWaiting(request);
+            tracker.onWaiting(params);
         }
         if (progressCallback != null) {
             progressCallback.onWaiting();
@@ -340,7 +431,7 @@ public class HttpTask<ResultType> extends AbsTask<ResultType> implements Progres
     @Override
     protected void onStarted() {
         if (tracker != null) {
-            tracker.onStart(request);
+            tracker.onStart(params);
         }
         if (progressCallback != null) {
             progressCallback.onStarted();
@@ -349,12 +440,11 @@ public class HttpTask<ResultType> extends AbsTask<ResultType> implements Progres
 
     @Override
     protected void onSuccess(ResultType result) {
+        if (hasException) return;
         if (tracker != null) {
-            tracker.onSuccess(request);
+            tracker.onSuccess(request, result);
         }
-        if (result != null) {
-            callback.onSuccess(result);
-        }
+        callback.onSuccess(result);
     }
 
     @Override
@@ -379,8 +469,12 @@ public class HttpTask<ResultType> extends AbsTask<ResultType> implements Progres
         if (tracker != null) {
             tracker.onFinished(request);
         }
-        clearRawResult();
-        IOUtil.closeQuietly(request);
+        x.task().run(new Runnable() {
+            @Override
+            public void run() {
+                closeRequestSync();
+            }
+        });
         callback.onFinished();
     }
 
@@ -393,9 +487,21 @@ public class HttpTask<ResultType> extends AbsTask<ResultType> implements Progres
 
     @Override
     protected void cancelWorks() {
-        if (requestWorker != null && params.isCancelFast()) {
-            requestWorker.interrupt();
-        }
+        x.task().run(new Runnable() {
+            @Override
+            public void run() {
+                closeRequestSync();
+            }
+        });
+    }
+
+    @Override
+    protected boolean isCancelFast() {
+        return params.isCancelFast();
+    }
+
+    private void closeRequestSync() {
+        clearRawResult();
         IOUtil.closeQuietly(request);
     }
 
@@ -410,8 +516,8 @@ public class HttpTask<ResultType> extends AbsTask<ResultType> implements Progres
     }
 
     // ############################### start: region implements ProgressHandler
-    private final static long RATE = 300; // 0.3s
     private long lastUpdateTime;
+    private long loadingUpdateMaxTimeSpan = 300; // 300ms
 
     /**
      * @param total
@@ -427,11 +533,15 @@ public class HttpTask<ResultType> extends AbsTask<ResultType> implements Progres
         }
 
         if (progressCallback != null && request != null && total > 0) {
+            if (total < current) {
+                total = current;
+            }
             if (forceUpdateUI) {
+                lastUpdateTime = System.currentTimeMillis();
                 this.update(FLAG_PROGRESS, total, current, request.isLoading());
             } else {
                 long currTime = System.currentTimeMillis();
-                if (currTime - lastUpdateTime >= RATE) {
+                if (currTime - lastUpdateTime >= loadingUpdateMaxTimeSpan) {
                     lastUpdateTime = currTime;
                     this.update(FLAG_PROGRESS, total, current, request.isLoading());
                 }
@@ -454,28 +564,26 @@ public class HttpTask<ResultType> extends AbsTask<ResultType> implements Progres
      * 该线程被join到HttpTask的工作线程去执行.
      * 它的主要作用是为了能强行中断请求的链接过程;
      * 并辅助限制同时下载文件的线程数.
-     * but:
-     * 创建一个Thread约耗时2毫秒, 优化?
      */
-    private final class RequestWorker extends Thread {
-        private final UriRequest request;
-        private final Type loadType;
-        private Object result;
-        private Throwable ex;
+    private final class RequestWorker {
+        /*private*/ Object result;
+        /*private*/ Throwable ex;
 
-        private RequestWorker(UriRequest request, Type loadType) {
-            this.request = request;
-            this.loadType = loadType;
+        private RequestWorker() {
         }
 
-        public void run() {
+        public void request() {
             try {
+                boolean interrupted = false;
                 if (File.class == loadType) {
                     while (sCurrFileLoadCount.get() >= MAX_FILE_LOAD_WORKER
                             && !HttpTask.this.isCancelled()) {
                         synchronized (sCurrFileLoadCount) {
                             try {
-                                sCurrFileLoadCount.wait();
+                                sCurrFileLoadCount.wait(10);
+                            } catch (InterruptedException iex) {
+                                interrupted = true;
+                                break;
                             } catch (Throwable ignored) {
                             }
                         }
@@ -483,13 +591,45 @@ public class HttpTask<ResultType> extends AbsTask<ResultType> implements Progres
                     sCurrFileLoadCount.incrementAndGet();
                 }
 
-                if (HttpTask.this.isCancelled()) {
-                    throw new Callback.CancelledException("cancelled before request");
+                if (interrupted || HttpTask.this.isCancelled()) {
+                    throw new Callback.CancelledException("cancelled before request" + (interrupted ? "(interrupted)" : ""));
                 }
 
-                this.result = request.loadResult();
+                try {
+                    request.setRequestInterceptListener(requestInterceptListener);
+                    this.result = request.loadResult();
+                } catch (Throwable ex) {
+                    this.ex = ex;
+                }
+
+                if (this.ex != null) {
+                    throw this.ex;
+                }
             } catch (Throwable ex) {
                 this.ex = ex;
+                if (ex instanceof HttpException) {
+                    HttpException httpEx = (HttpException) ex;
+                    int errorCode = httpEx.getCode();
+                    if (errorCode == 301 || errorCode == 302) {
+                        RedirectHandler redirectHandler = params.getRedirectHandler();
+                        if (redirectHandler != null) {
+                            try {
+                                RequestParams redirectParams = redirectHandler.getRedirectParams(request);
+                                if (redirectParams != null) {
+                                    if (redirectParams.getMethod() == null) {
+                                        redirectParams.setMethod(params.getMethod());
+                                    }
+                                    // 开始重定向请求
+                                    HttpTask.this.params = redirectParams;
+                                    HttpTask.this.request = createNewRequest();
+                                    this.ex = new HttpRedirectException(errorCode, httpEx.getMessage(), httpEx.getResult());
+                                }
+                            } catch (Throwable throwable) {
+                                this.ex = ex;
+                            }
+                        }
+                    }
+                }
             } finally {
                 if (File.class == loadType) {
                     synchronized (sCurrFileLoadCount) {

@@ -1,16 +1,19 @@
 package org.xutils.sample.db;
 
+import org.xutils.DbManager;
 import org.xutils.db.annotation.Column;
 import org.xutils.db.annotation.Table;
+import org.xutils.ex.DbException;
 
 import java.util.Date;
+import java.util.List;
 
 /**
  * Author: wyouflf
  * Date: 13-7-25
  * Time: 下午7:06
  */
-@Table(name = "parent", runOnTableCreated = "CREATE UNIQUE INDEX index_name ON parent(name,email)")
+@Table(name = "parent", onCreated = "CREATE UNIQUE INDEX index_name ON parent(name,email)")
 public class Parent {
 
     @Column(name = "id", isId = true)
@@ -30,6 +33,15 @@ public class Parent {
 
     @Column(name = "date")
     private java.sql.Date date;
+
+    public List<Child> getChildren(DbManager db) throws DbException {
+        return db.selector(Child.class).where("parentId", "=", this.id).findAll();
+    }
+
+    // 一对一
+    //public Child getChild(DbManager db) throws DbException {
+    //    return db.selector(Child.class).where("parentId", "=", this.id).findFirst();
+    //}
 
     public int getId() {
         return id;

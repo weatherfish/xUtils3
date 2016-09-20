@@ -1,6 +1,7 @@
 package org.xutils;
 
 import android.app.Application;
+import android.content.Context;
 
 import org.xutils.common.TaskController;
 import org.xutils.common.task.TaskControllerImpl;
@@ -8,6 +9,12 @@ import org.xutils.db.DbManagerImpl;
 import org.xutils.http.HttpManagerImpl;
 import org.xutils.image.ImageManagerImpl;
 import org.xutils.view.ViewInjectorImpl;
+
+import java.lang.reflect.Method;
+
+import javax.net.ssl.HostnameVerifier;
+import javax.net.ssl.HttpsURLConnection;
+import javax.net.ssl.SSLSession;
 
 
 /**
@@ -26,7 +33,16 @@ public final class x {
 
     public static Application app() {
         if (Ext.app == null) {
-            throw new RuntimeException("please invoke x.Ext.init(app) on Application#onCreate()");
+            try {
+                // 在IDE进行布局预览时使用
+                Class<?> renderActionClass = Class.forName("com.android.layoutlib.bridge.impl.RenderAction");
+                Method method = renderActionClass.getDeclaredMethod("getCurrentContext");
+                Context context = (Context) method.invoke(null);
+                Ext.app = new MockApplication(context);
+            } catch (Throwable ignored) {
+                throw new RuntimeException("please invoke x.Ext.init(app) on Application#onCreate()"
+                        + " and register your Application in manifest.");
+            }
         }
         return Ext.app;
     }
@@ -73,6 +89,13 @@ public final class x {
 
         static {
             TaskControllerImpl.registerInstance();
+            // 默认信任所有https域名
+            HttpsURLConnection.setDefaultHostnameVerifier(new HostnameVerifier() {
+                @Override
+                public boolean verify(String hostname, SSLSession session) {
+                    return true;
+                }
+            });
         }
 
         public static void init(Application app) {
@@ -101,6 +124,12 @@ public final class x {
 
         public static void setViewInjector(ViewInjector viewInjector) {
             Ext.viewInjector = viewInjector;
+        }
+    }
+
+    private static class MockApplication extends Application {
+        public MockApplication(Context baseContext) {
+            this.attachBaseContext(baseContext);
         }
     }
 }

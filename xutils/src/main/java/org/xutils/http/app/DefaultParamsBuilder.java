@@ -1,14 +1,10 @@
 package org.xutils.http.app;
 
-import android.text.TextUtils;
-
 import org.xutils.common.util.LogUtil;
 import org.xutils.http.RequestParams;
 import org.xutils.http.annotation.HttpRequest;
 
 import java.security.cert.X509Certificate;
-import java.util.HashMap;
-import java.util.Map;
 
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLSocketFactory;
@@ -24,50 +20,69 @@ public class DefaultParamsBuilder implements ParamsBuilder {
     public DefaultParamsBuilder() {
     }
 
+    /**
+     * 根据@HttpRequest构建请求的url
+     *
+     * @param params
+     * @param httpRequest
+     * @return
+     */
     @Override
-    public String buildUri(HttpRequest httpRequest) {
+    public String buildUri(RequestParams params, HttpRequest httpRequest) {
         return httpRequest.host() + "/" + httpRequest.path();
     }
 
+    /**
+     * 根据注解的cacheKeys构建缓存的自定义key,
+     * 如果返回null, 默认使用 url 和整个 query string 组成.
+     *
+     * @param params
+     * @param cacheKeys
+     * @return
+     */
     @Override
     public String buildCacheKey(RequestParams params, String[] cacheKeys) {
-        String cacheKey = params.getUri() + "@";
+        String cacheKey = null;
         if (cacheKeys != null && cacheKeys.length > 0) {
-            // 添加cacheKeys对应的queryParams
-            HashMap<String, String> queryParams = params.getQueryStringParams();
-            if (queryParams != null) {
-                for (String key : cacheKeys) {
-                    String value = queryParams.get(key);
-                    if (!TextUtils.isEmpty(value)) {
-                        cacheKey += key + "=" + value + "&";
-                    }
-                }
-            }
-        } else {
-            // 添加所有queryParams
-            HashMap<String, String> queryParams = params.getQueryStringParams();
-            if (queryParams != null) {
-                for (Map.Entry<String, String> entry : queryParams.entrySet()) {
-                    String name = entry.getKey();
-                    String value = entry.getValue();
-                    if (!TextUtils.isEmpty(name) && !TextUtils.isEmpty(value)) {
-                        cacheKey += name + "=" + value + "&";
-                    }
+
+            cacheKey = params.getUri() + "?";
+
+            // 添加cacheKeys对应的参数
+            for (String key : cacheKeys) {
+                String value = params.getStringParameter(key);
+                if (value != null) {
+                    cacheKey += key + "=" + value + "&";
                 }
             }
         }
         return cacheKey;
     }
 
+    /**
+     * 自定义SSLSocketFactory
+     *
+     * @return
+     */
     @Override
     public SSLSocketFactory getSSLSocketFactory() {
         return getTrustAllSSLSocketFactory();
     }
 
+    /**
+     * 为请求添加通用参数等操作
+     *
+     * @param params
+     */
     @Override
     public void buildParams(RequestParams params) {
     }
 
+    /**
+     * 自定义参数签名
+     *
+     * @param params
+     * @param signs
+     */
     @Override
     public void buildSign(RequestParams params, String[] signs) {
 
@@ -81,21 +96,20 @@ public class DefaultParamsBuilder implements ParamsBuilder {
                 if (trustAllSSlSocketFactory == null) {
 
                     // 信任所有证书
-                    TrustManager[] trustAllCerts = new TrustManager[]{
-                            new X509TrustManager() {
-                                @Override
-                                public X509Certificate[] getAcceptedIssuers() {
-                                    return null;
-                                }
+                    TrustManager[] trustAllCerts = new TrustManager[]{new X509TrustManager() {
+                        @Override
+                        public X509Certificate[] getAcceptedIssuers() {
+                            return null;
+                        }
 
-                                @Override
-                                public void checkClientTrusted(X509Certificate[] certs, String authType) {
-                                }
+                        @Override
+                        public void checkClientTrusted(X509Certificate[] certs, String authType) {
+                        }
 
-                                @Override
-                                public void checkServerTrusted(X509Certificate[] certs, String authType) {
-                                }
-                            }};
+                        @Override
+                        public void checkServerTrusted(X509Certificate[] certs, String authType) {
+                        }
+                    }};
                     try {
                         SSLContext sslContext = SSLContext.getInstance("TLS");
                         sslContext.init(null, trustAllCerts, null);

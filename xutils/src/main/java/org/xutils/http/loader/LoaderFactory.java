@@ -4,11 +4,10 @@ package org.xutils.http.loader;
 import org.json.JSONArray;
 import org.json.JSONObject;
 import org.xutils.http.RequestParams;
-import org.xutils.http.app.RequestTracker;
 
 import java.io.File;
+import java.lang.reflect.Type;
 import java.util.HashMap;
-import java.util.Map;
 
 /**
  * Author: wyouflf
@@ -19,20 +18,12 @@ public final class LoaderFactory {
     private LoaderFactory() {
     }
 
-    private static RequestTracker defaultTracker;
-
     /**
      * key: loadType
      */
-    private static final HashMap<Class<?>, RequestTracker> trackerHashMap = new HashMap<Class<?>, RequestTracker>();
-
-    /**
-     * key: loadType
-     */
-    private static final HashMap<Class<?>, Loader> converterHashMap = new HashMap<Class<?>, Loader>();
+    private static final HashMap<Type, Loader> converterHashMap = new HashMap<Type, Loader>();
 
     static {
-        converterHashMap.put(Map.class, new MapLoader());
         converterHashMap.put(JSONObject.class, new JSONObjectLoader());
         converterHashMap.put(JSONArray.class, new JSONArrayLoader());
         converterHashMap.put(String.class, new StringLoader());
@@ -47,28 +38,18 @@ public final class LoaderFactory {
     }
 
     @SuppressWarnings("unchecked")
-    public static Loader<?> getLoader(Class<?> type, RequestParams params) {
+    public static Loader<?> getLoader(Type type, RequestParams params) {
         Loader<?> result = converterHashMap.get(type);
         if (result == null) {
             result = new ObjectLoader(type);
         } else {
             result = result.newInstance();
-            RequestTracker tracker = trackerHashMap.get(type);
-            result.setResponseTracker(tracker == null ? defaultTracker : tracker);
         }
         result.setParams(params);
         return result;
     }
 
-    public static <T> void registerLoader(Class<T> type, Loader<T> loader) {
+    public static <T> void registerLoader(Type type, Loader<T> loader) {
         converterHashMap.put(type, loader);
-    }
-
-    public static void registerDefaultTracker(RequestTracker tracker) {
-        defaultTracker = tracker;
-    }
-
-    public static void registerTracker(Class<?> type, RequestTracker tracker) {
-        trackerHashMap.put(type, tracker);
     }
 }

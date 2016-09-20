@@ -2,29 +2,16 @@ package org.xutils.http;
 
 import android.text.TextUtils;
 
-import org.json.JSONException;
-import org.json.JSONObject;
 import org.xutils.common.task.Priority;
 import org.xutils.common.util.LogUtil;
 import org.xutils.http.annotation.HttpRequest;
 import org.xutils.http.app.DefaultParamsBuilder;
+import org.xutils.http.app.HttpRetryHandler;
 import org.xutils.http.app.ParamsBuilder;
-import org.xutils.http.body.BodyParamsBody;
-import org.xutils.http.body.ContentTypeInputStream;
-import org.xutils.http.body.FileBody;
-import org.xutils.http.body.InputStreamBody;
-import org.xutils.http.body.MultipartBody;
-import org.xutils.http.body.RequestBody;
-import org.xutils.http.body.StringBody;
+import org.xutils.http.app.RedirectHandler;
+import org.xutils.http.app.RequestTracker;
 
-import java.io.ByteArrayInputStream;
-import java.io.File;
-import java.io.IOException;
-import java.io.InputStream;
-import java.lang.reflect.Field;
 import java.net.Proxy;
-import java.util.HashMap;
-import java.util.Map;
 import java.util.concurrent.Executor;
 
 import javax.net.ssl.SSLSocketFactory;
@@ -33,9 +20,10 @@ import javax.net.ssl.SSLSocketFactory;
  * Created by wyouflf on 15/7/17.
  * 网络请求参数实体
  */
-public class RequestParams {
+public class RequestParams extends BaseParams {
 
-    // 外部参数
+    // 注解及其扩展参数
+    private HttpRequest httpRequest;
     private final String uri;
     private final String[] signs;
     private final String[] cacheKeys;
@@ -44,21 +32,12 @@ public class RequestParams {
     private String buildCacheKey;
     private SSLSocketFactory sslSocketFactory;
 
-    // 请求体内容
-    private HttpMethod method;
-    private String bodyContent;
-    private HashMap<String, String> headers;
-    private HashMap<String, String> queryStringParams;
-    private HashMap<String, Object> bodyParams;
-    private HashMap<String, Object> fileParams;
-    private RequestBody requestBody;
-
     // 扩展参数
     private Proxy proxy; // 代理
-    private String charset = "UTF-8";
+    private boolean useCookie = true; // 是否在请求过程中启用cookie
     private String cacheDirName; // 缓存文件夹名称
-    private boolean asJsonContent = false; // 用json形式的bodyContent上传
-    private HttpRequest httpRequest; // 注解参数
+    private long cacheSize; // 缓存文件夹大小
+    private long cacheMaxAge; // 默认缓存存活时间, 单位:毫秒.(如果服务没有返回有效的max-age或Expires)
     private Executor executor; // 自定义线程池
     private Priority priority = Priority.DEFAULT; // 请求优先级
     private int connectTimeout = 1000 * 15; // 连接超时时间
@@ -66,8 +45,11 @@ public class RequestParams {
     private boolean autoRename = false; // 是否根据头信息自动命名文件
     private int maxRetryCount = 2; // 最大请求错误重试次数
     private String saveFilePath; // 下载文件时文件保存的路径和文件名
-    private boolean multipart = false; // 是否强制使用multipart表单
     private boolean cancelFast = false; // 是否可以被立即停止, true: 为请求创建新的线程, 取消时请求线程被立即中断.
+    private int loadingUpdateMaxTimeSpan = 300; // 进度刷新最大间隔时间(ms)
+    private HttpRetryHandler httpRetryHandler; // 自定义HttpRetryHandler
+    private RedirectHandler redirectHandler; // 自定义重定向接口, 默认系统自动重定向.
+    private RequestTracker requestTracker; // 自定义日志记录接口.
 
     /**
      * 使用空构造创建时必须, 必须是带有@HttpRequest注解的子类.
@@ -99,30 +81,31 @@ public class RequestParams {
         this.builder = builder;
     }
 
-    // invoke via HttpTask#initRequest
+    // invoke via HttpTask#createNewRequest
     /*package*/ void init() throws Throwable {
+        if (!TextUtils.isEmpty(buildUri)) return;
+
         if (TextUtils.isEmpty(uri) && getHttpRequest() == null) {
             throw new IllegalStateException("uri is empty && @HttpRequest == null");
         }
 
+        // init params from entity
         initEntityParams();
 
         // build uri & cacheKey
+        buildUri = uri;
         HttpRequest httpRequest = this.getHttpRequest();
         if (httpRequest != null) {
             builder = httpRequest.builder().newInstance();
+            buildUri = builder.buildUri(this, httpRequest);
             builder.buildParams(this);
             builder.buildSign(this, httpRequest.signs());
-            buildUri = builder.buildUri(httpRequest);
-            buildCacheKey = builder.buildCacheKey(this, httpRequest.cacheKeys());
             if (sslSocketFactory == null) {
                 sslSocketFactory = builder.getSSLSocketFactory();
             }
         } else if (this.builder != null) {
             builder.buildParams(this);
             builder.buildSign(this, signs);
-            buildUri = uri;
-            buildCacheKey = builder.buildCacheKey(this, cacheKeys);
             if (sslSocketFactory == null) {
                 sslSocketFactory = builder.getSSLSocketFactory();
             }
@@ -134,6 +117,14 @@ public class RequestParams {
     }
 
     public String getCacheKey() {
+        if (TextUtils.isEmpty(buildCacheKey) && builder != null) {
+            HttpRequest httpRequest = this.getHttpRequest();
+            if (httpRequest != null) {
+                buildCacheKey = builder.buildCacheKey(this, httpRequest.cacheKeys());
+            } else {
+                buildCacheKey = builder.buildCacheKey(this, cacheKeys);
+            }
+        }
         return buildCacheKey;
     }
 
@@ -145,22 +136,22 @@ public class RequestParams {
         return sslSocketFactory;
     }
 
-    /*package*/ void setMethod(HttpMethod method) {
-        this.method = method;
+    /**
+     * 是否在请求过程中启用cookie, 默认true.
+     *
+     * @return
+     */
+    public boolean isUseCookie() {
+        return useCookie;
     }
 
-    public HttpMethod getMethod() {
-        return method;
-    }
-
-    public void setCharset(String charset) {
-        if (!TextUtils.isEmpty(charset)) {
-            this.charset = charset;
-        }
-    }
-
-    public String getCharset() {
-        return charset;
+    /**
+     * 是否在请求过程中启用cookie, 默认true.
+     *
+     * @param useCookie
+     */
+    public void setUseCookie(boolean useCookie) {
+        this.useCookie = useCookie;
     }
 
     public Proxy getProxy() {
@@ -197,10 +188,46 @@ public class RequestParams {
         this.cacheDirName = cacheDirName;
     }
 
+    public long getCacheSize() {
+        return cacheSize;
+    }
+
+    public void setCacheSize(long cacheSize) {
+        this.cacheSize = cacheSize;
+    }
+
+    /**
+     * 默认缓存存活时间, 单位:毫秒.(如果服务没有返回有效的max-age或Expires)
+     *
+     * @return
+     */
+    public long getCacheMaxAge() {
+        return cacheMaxAge;
+    }
+
+    /**
+     * 默认缓存存活时间, 单位:毫秒.(如果服务没有返回有效的max-age或Expires)
+     *
+     * @param cacheMaxAge
+     */
+    public void setCacheMaxAge(long cacheMaxAge) {
+        this.cacheMaxAge = cacheMaxAge;
+    }
+
+    /**
+     * 自定义线程池
+     *
+     * @return
+     */
     public Executor getExecutor() {
         return executor;
     }
 
+    /**
+     * 自定义线程池
+     *
+     * @param executor
+     */
     public void setExecutor(Executor executor) {
         this.executor = executor;
     }
@@ -261,14 +288,6 @@ public class RequestParams {
         this.maxRetryCount = maxRetryCount;
     }
 
-    public boolean isMultipart() {
-        return multipart;
-    }
-
-    public void setMultipart(boolean multipart) {
-        this.multipart = multipart;
-    }
-
     /**
      * 是否可以被立即停止.
      *
@@ -287,277 +306,86 @@ public class RequestParams {
         this.cancelFast = cancelFast;
     }
 
-    public void addHeader(String name, String value) {
-        if (this.headers == null) {
-            this.headers = new HashMap<String, String>();
-        }
-        this.headers.put(name, value);
-    }
-
-    public void addParameter(String name, Object value) {
-        if (value == null) return;
-        if (HttpMethod.permitsRequestBody(method)) {
-            if (!TextUtils.isEmpty(name)) {
-                if (value instanceof File) {
-                    this.addBodyParameter(name, (File) value);
-                } else if (value instanceof InputStream) {
-                    this.addBodyParameter(name, (InputStream) value, null);
-                } else if (value instanceof byte[]) {
-                    this.addBodyParameter(name, (byte[]) value);
-                } else {
-                    if (this.bodyParams == null) {
-                        this.bodyParams = new HashMap<String, Object>();
-                    }
-                    this.bodyParams.put(name, value);
-                }
-            } else if (TextUtils.isEmpty(name)) {
-                this.setBodyContent(value.toString());
-            }
-        } else {
-            if (!TextUtils.isEmpty(name)) {
-                this.addQueryStringParameter(name, value.toString());
-            }
-        }
-    }
-
-    public void addQueryStringParameter(String name, String value) {
-        if (this.queryStringParams == null) {
-            this.queryStringParams = new HashMap<String, String>();
-        }
-        this.queryStringParams.put(name, value);
-    }
-
-    public void addBodyParameter(String name, String value) {
-        if (this.bodyParams == null) {
-            this.bodyParams = new HashMap<String, Object>();
-        }
-        this.bodyParams.put(name, value);
-    }
-
-    public void addBodyParameter(String name, File file) {
-        if (this.fileParams == null) {
-            this.fileParams = new HashMap<String, Object>();
-        }
-        this.fileParams.put(name, file);
-    }
-
-    public void addBodyParameter(String name, byte[] data) {
-        if (this.fileParams == null) {
-            this.fileParams = new HashMap<String, Object>();
-        }
-        this.fileParams.put(name, data);
-    }
-
-    public void addBodyParameter(String name, InputStream stream, String contentType) {
-        if (this.fileParams == null) {
-            this.fileParams = new HashMap<String, Object>();
-        }
-        if (stream instanceof ContentTypeInputStream) {
-            this.fileParams.put(name, stream);
-        } else {
-            this.fileParams.put(name, new ContentTypeInputStream(stream, contentType));
-        }
+    public int getLoadingUpdateMaxTimeSpan() {
+        return loadingUpdateMaxTimeSpan;
     }
 
     /**
-     * 用json形式的bodyContent上传
+     * 进度刷新最大间隔时间(默认300毫秒)
      *
-     * @return
+     * @param loadingUpdateMaxTimeSpan
      */
-    public boolean isAsJsonContent() {
-        return asJsonContent;
+    public void setLoadingUpdateMaxTimeSpan(int loadingUpdateMaxTimeSpan) {
+        this.loadingUpdateMaxTimeSpan = loadingUpdateMaxTimeSpan;
+    }
+
+    public HttpRetryHandler getHttpRetryHandler() {
+        return httpRetryHandler;
+    }
+
+    public void setHttpRetryHandler(HttpRetryHandler httpRetryHandler) {
+        this.httpRetryHandler = httpRetryHandler;
+    }
+
+    public RedirectHandler getRedirectHandler() {
+        return redirectHandler;
     }
 
     /**
-     * 用json形式的bodyContent上传
+     * 自定义重定向接口, 默认系统自动重定向.
      *
-     * @param asJsonContent
+     * @param redirectHandler
      */
-    public void setAsJsonContent(boolean asJsonContent) {
-        this.asJsonContent = asJsonContent;
+    public void setRedirectHandler(RedirectHandler redirectHandler) {
+        this.redirectHandler = redirectHandler;
     }
 
-    public void setBodyContent(String content) {
-        this.bodyContent = content;
+    public RequestTracker getRequestTracker() {
+        return requestTracker;
     }
 
-    public String getBodyContent() {
-        return bodyContent;
-    }
-
-    public HashMap<String, String> getHeaders() {
-        return headers;
-    }
-
-    public HashMap<String, String> getQueryStringParams() {
-        checkBodyParams();
-        return queryStringParams;
-    }
-
-    public HashMap<String, Object> getBodyParams() {
-        checkBodyParams();
-        return bodyParams;
-    }
-
-    public HashMap<String, String> getStringParams() {
-        HashMap<String, String> result = new HashMap<String, String>();
-        if (queryStringParams != null) {
-            result.putAll(queryStringParams);
-        }
-        if (bodyParams != null) {
-            for (Map.Entry<String, Object> entry : bodyParams.entrySet()) {
-                String key = entry.getKey();
-                Object value = entry.getValue();
-                if (!TextUtils.isEmpty(key) && value != null) {
-                    result.put(key, value.toString());
-                }
-            }
-        }
-        return result;
-    }
-
-    public void clearParams() {
-        if (queryStringParams != null) {
-            queryStringParams.clear();
-        }
-        if (bodyParams != null) {
-            bodyParams.clear();
-        }
-        if (fileParams != null) {
-            fileParams.clear();
-        }
-        requestBody = null;
-    }
-
-    public String getStringParam(String key) {
-        if (queryStringParams != null && queryStringParams.containsKey(key)) {
-            return queryStringParams.get(key);
-        } else if (bodyParams != null && bodyParams.containsKey(key)) {
-            Object value = bodyParams.get(key);
-            return value == null ? null : value.toString();
-        } else {
-            return null;
-        }
-    }
-
-    private void checkBodyParams() {
-        if (bodyParams != null && (!TextUtils.isEmpty(bodyContent) || requestBody != null)) {
-            if (this.queryStringParams == null) {
-                this.queryStringParams = new HashMap<String, String>();
-            }
-            for (Map.Entry<String, Object> entry : bodyParams.entrySet()) {
-                String key = entry.getKey();
-                Object value = entry.getValue();
-                if (!TextUtils.isEmpty(key) && value != null) {
-                    queryStringParams.put(key, value.toString());
-                }
-            }
-
-            bodyParams.clear();
-            bodyParams = null;
-        }
-
-        if (bodyParams != null && (multipart || (fileParams != null && fileParams.size() > 0))) {
-            if (this.fileParams == null) {
-                this.fileParams = new HashMap<String, Object>();
-            }
-            fileParams.putAll(bodyParams);
-            bodyParams.clear();
-            bodyParams = null;
-        }
-
-        if (asJsonContent && bodyParams != null && !bodyParams.isEmpty()) {
-            JSONObject jsonObject = new JSONObject();
-            for (Map.Entry<String, Object> entry : bodyParams.entrySet()) {
-                String key = entry.getKey();
-                Object value = entry.getValue();
-                if (!TextUtils.isEmpty(key) && value != null) {
-                    try {
-                        jsonObject.put(key, value);
-                    } catch (JSONException ex) {
-                        throw new RuntimeException(ex);
-                    }
-                }
-            }
-
-            setBodyContent(jsonObject.toString());
-            bodyParams.clear();
-            bodyParams = null;
-        }
-    }
-
-    public void setRequestBody(RequestBody requestBody) {
-        this.requestBody = requestBody;
-    }
-
-    public RequestBody getRequestBody() throws IOException {
-        checkBodyParams();
-        if (this.requestBody != null) {
-            return this.requestBody;
-        }
-        RequestBody result = null;
-        if (!TextUtils.isEmpty(bodyContent)) {
-            result = new StringBody(bodyContent, charset);
-        } else if (multipart || (fileParams != null && fileParams.size() > 0)) {
-            if (!multipart && fileParams.size() == 1) {
-                for (Object value : fileParams.values()) {
-                    if (value instanceof File) {
-                        result = new FileBody((File) value);
-                    } else if (value instanceof ContentTypeInputStream) {
-                        ContentTypeInputStream wIn = (ContentTypeInputStream) value;
-                        result = new InputStreamBody(wIn.getBase(), wIn.getContentType());
-                    } else if (value instanceof InputStream) {
-                        result = new InputStreamBody((InputStream) value, null);
-                    } else if (value instanceof byte[]) {
-                        result = new InputStreamBody(new ByteArrayInputStream((byte[]) value), null);
-                    }
-                    break;
-                }
-            } else {
-                multipart = true;
-                result = new MultipartBody(fileParams, charset);
-            }
-        } else if (bodyParams != null && bodyParams.size() > 0) {
-            result = new BodyParamsBody(bodyParams, charset);
-        }
-
-        return result;
+    public void setRequestTracker(RequestTracker requestTracker) {
+        this.requestTracker = requestTracker;
     }
 
     private void initEntityParams() {
-        addEntityParams2Map(this.getClass());
-    }
-
-    private void addEntityParams2Map(Class<?> type) {
-        if (type == null || type == RequestParams.class || type == Object.class) {
-            return;
-        }
-
-        Field[] fields = type.getDeclaredFields();
-        if (fields != null && fields.length > 0) {
-            for (Field field : fields) {
-                field.setAccessible(true);
-                try {
-                    Object value = field.get(this);
-                    if (value != null) {
-                        this.addParameter(field.getName(), value);
-                    }
-                } catch (IllegalAccessException ex) {
-                    LogUtil.e(ex.getMessage(), ex);
-                }
+        RequestParamsHelper.parseKV(this, this.getClass(), new RequestParamsHelper.ParseKVListener() {
+            @Override
+            public void onParseKV(String name, Object value) {
+                addParameter(name, value);
             }
-        }
-
-        addEntityParams2Map(type.getSuperclass());
+        });
     }
+
+    private boolean invokedGetHttpRequest = false;
 
     private HttpRequest getHttpRequest() {
-        if (httpRequest == null) {
+        if (httpRequest == null && !invokedGetHttpRequest) {
+            invokedGetHttpRequest = true;
             Class<?> thisCls = this.getClass();
             if (thisCls != RequestParams.class) {
                 httpRequest = thisCls.getAnnotation(HttpRequest.class);
             }
         }
+
         return httpRequest;
+    }
+
+    /**
+     * 在网络请求onStart前, 尽量不要在UI线程调用这个方法, 可能产生性能影响.
+     *
+     * @return
+     */
+    @Override
+    public String toString() {
+        try {
+            this.init();
+        } catch (Throwable ex) {
+            LogUtil.e(ex.getMessage(), ex);
+        }
+        String url = this.getUri();
+        return TextUtils.isEmpty(url) ?
+                super.toString() :
+                url + (url.contains("?") ? "&" : "?") + super.toString();
     }
 }

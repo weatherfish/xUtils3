@@ -8,6 +8,7 @@ import java.io.File;
 import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.lang.reflect.Type;
 import java.util.List;
 import java.util.Map;
 
@@ -19,12 +20,12 @@ public class LocalFileRequest extends UriRequest {
 
     private InputStream inputStream;
 
-    LocalFileRequest(RequestParams params, Class<?> loadType) throws Throwable {
+    LocalFileRequest(RequestParams params, Type loadType) throws Throwable {
         super(params, loadType);
     }
 
     @Override
-    public void sendRequest() throws IOException {
+    public void sendRequest() throws Throwable {
 
     }
 
@@ -62,7 +63,13 @@ public class LocalFileRequest extends UriRequest {
     }
 
     private File getFile() {
-        String filePath = queryUrl.substring(7);
+        String filePath = null;
+        if (queryUrl.startsWith("file:")) {
+            filePath = queryUrl.substring("file:".length());
+        } else {
+            filePath = queryUrl;
+        }
+        // filePath开始位置多余的"/"或被自动去掉
         return new File(filePath);
     }
 
@@ -88,6 +95,11 @@ public class LocalFileRequest extends UriRequest {
     @Override
     public int getResponseCode() throws IOException {
         return getFile().exists() ? 200 : 404;
+    }
+
+    @Override
+    public String getResponseMessage() throws IOException {
+        return null;
     }
 
     @Override

@@ -1,5 +1,7 @@
 package org.xutils.http.body;
 
+import android.text.TextUtils;
+
 import java.io.IOException;
 import java.io.OutputStream;
 import java.io.UnsupportedEncodingException;
@@ -11,11 +13,14 @@ import java.io.UnsupportedEncodingException;
 public class StringBody implements RequestBody {
 
     private byte[] content;
-    private String charset;
+    private String contentType;
+    private String charset = "UTF-8";
 
     public StringBody(String str, String charset) throws UnsupportedEncodingException {
-        this.content = str.getBytes(charset);
-        this.charset = charset;
+        if (!TextUtils.isEmpty(charset)) {
+            this.charset = charset;
+        }
+        this.content = str.getBytes(this.charset);
     }
 
     @Override
@@ -24,8 +29,13 @@ public class StringBody implements RequestBody {
     }
 
     @Override
+    public void setContentType(String contentType) {
+        this.contentType = contentType;
+    }
+
+    @Override
     public String getContentType() {
-        return "application/json;charset=" + charset;
+        return TextUtils.isEmpty(contentType) ? "application/json;charset=" + charset : contentType;
     }
 
     @Override

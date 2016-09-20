@@ -3,8 +3,11 @@ package org.xutils.http.body;
 import android.text.TextUtils;
 
 import org.xutils.common.Callback;
+import org.xutils.common.util.IOUtil;
 import org.xutils.http.ProgressHandler;
 
+import java.io.ByteArrayInputStream;
+import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -19,23 +22,19 @@ public class InputStreamBody implements ProgressBody {
     private InputStream content;
     private String contentType;
 
-    private long total;
+    private final long total;
     private long current = 0;
 
     private ProgressHandler callBackHandler;
 
+    public InputStreamBody(InputStream inputStream) {
+        this(inputStream, null);
+    }
+
     public InputStreamBody(InputStream inputStream, String contentType) {
         this.content = inputStream;
-        if (TextUtils.isEmpty(contentType)) {
-            this.contentType = "application/octet-stream";
-        } else {
-            this.contentType = contentType;
-        }
-        try {
-            this.total = inputStream.available();
-        } catch (IOException e) {
-            this.total = -1;
-        }
+        this.contentType = contentType;
+        this.total = getInputStreamLength(inputStream);
     }
 
     @Override
@@ -49,8 +48,13 @@ public class InputStreamBody implements ProgressBody {
     }
 
     @Override
+    public void setContentType(String contentType) {
+        this.contentType = contentType;
+    }
+
+    @Override
     public String getContentType() {
-        return contentType;
+        return TextUtils.isEmpty(contentType) ? "application/octet-stream" : contentType;
     }
 
     @Override
@@ -75,10 +79,18 @@ public class InputStreamBody implements ProgressBody {
                 callBackHandler.updateProgress(total, total, true);
             }
         } finally {
-            try {
-                content.close();
-            } catch (Throwable ignored) {
-            }
+            IOUtil.closeQuietly(content);
         }
+    }
+
+    public static long getInputStreamLength(InputStream inputStream) {
+        try {
+            if (inputStream instanceof FileInputStream ||
+                    inputStream instanceof ByteArrayInputStream) {
+                return inputStream.available();
+            }
+        } catch (Throwable ignored) {
+        }
+        return -1L;
     }
 }

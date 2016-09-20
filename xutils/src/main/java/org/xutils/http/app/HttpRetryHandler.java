@@ -1,10 +1,11 @@
-package org.xutils.http;
+package org.xutils.http.app;
 
 
 import org.json.JSONException;
 import org.xutils.common.Callback;
 import org.xutils.common.util.LogUtil;
 import org.xutils.ex.HttpException;
+import org.xutils.http.HttpMethod;
 import org.xutils.http.request.UriRequest;
 
 import java.io.FileNotFoundException;
@@ -12,7 +13,6 @@ import java.net.MalformedURLException;
 import java.net.NoRouteToHostException;
 import java.net.PortUnreachableException;
 import java.net.ProtocolException;
-import java.net.SocketTimeoutException;
 import java.net.URISyntaxException;
 import java.net.UnknownHostException;
 import java.util.HashSet;
@@ -21,11 +21,11 @@ import java.util.HashSet;
  * Author: wyouflf
  * Time: 2014/05/30
  */
-public final class HttpRetryHandler {
+public class HttpRetryHandler {
 
-    private int maxRetryCount;
+    protected int maxRetryCount = 2;
 
-    private static HashSet<Class<?>> blackList = new HashSet<Class<?>>();
+    protected static HashSet<Class<?>> blackList = new HashSet<Class<?>>();
 
     static {
         blackList.add(HttpException.class);
@@ -38,44 +38,36 @@ public final class HttpRetryHandler {
         blackList.add(NullPointerException.class);
         blackList.add(FileNotFoundException.class);
         blackList.add(JSONException.class);
-        blackList.add(SocketTimeoutException.class);
         blackList.add(UnknownHostException.class);
         blackList.add(IllegalArgumentException.class);
     }
 
     public HttpRetryHandler() {
-        this(2);
-    }
-
-    public HttpRetryHandler(int maxRetryCount) {
-        this.maxRetryCount = maxRetryCount;
-    }
-
-    public int getMaxRetryCount() {
-        return maxRetryCount;
     }
 
     public void setMaxRetryCount(int maxRetryCount) {
         this.maxRetryCount = maxRetryCount;
     }
 
-    boolean retryRequest(Throwable ex, int count, UriRequest request) {
+    public boolean canRetry(UriRequest request, Throwable ex, int count) {
 
-        if (count > maxRetryCount || request == null) {
+        LogUtil.w(ex.getMessage(), ex);
+
+        if (count > maxRetryCount) {
+            LogUtil.w(request.toString());
             LogUtil.w("The Max Retry times has been reached!");
-            LogUtil.w(ex.getMessage(), ex);
             return false;
         }
 
         if (!HttpMethod.permitsRetry(request.getParams().getMethod())) {
+            LogUtil.w(request.toString());
             LogUtil.w("The Request Method can not be retried.");
-            LogUtil.w(ex.getMessage(), ex);
             return false;
         }
 
         if (blackList.contains(ex.getClass())) {
+            LogUtil.w(request.toString());
             LogUtil.w("The Exception can not be retried.");
-            LogUtil.w(ex.getMessage(), ex);
             return false;
         }
 

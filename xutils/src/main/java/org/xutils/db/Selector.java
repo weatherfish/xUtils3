@@ -23,7 +23,7 @@ import org.xutils.db.table.DbModel;
 import org.xutils.db.table.TableEntity;
 import org.xutils.ex.DbException;
 
-import java.util.LinkedList;
+import java.util.ArrayList;
 import java.util.List;
 
 /**
@@ -97,7 +97,7 @@ public final class Selector<T> {
 
     public Selector<T> orderBy(String columnName) {
         if (orderByList == null) {
-            orderByList = new LinkedList<OrderBy>();
+            orderByList = new ArrayList<OrderBy>(5);
         }
         orderByList.add(new OrderBy(columnName));
         return this;
@@ -105,7 +105,7 @@ public final class Selector<T> {
 
     public Selector<T> orderBy(String columnName, boolean desc) {
         if (orderByList == null) {
-            orderByList = new LinkedList<OrderBy>();
+            orderByList = new ArrayList<OrderBy>(5);
         }
         orderByList.add(new OrderBy(columnName, desc));
         return this;
@@ -167,7 +167,7 @@ public final class Selector<T> {
         Cursor cursor = table.getDb().execQuery(this.toString());
         if (cursor != null) {
             try {
-                result = new LinkedList<T>();
+                result = new ArrayList<T>();
                 while (cursor.moveToNext()) {
                     T entity = CursorUtils.getEntity(table, cursor);
                     result.add(entity);
@@ -184,7 +184,7 @@ public final class Selector<T> {
     public long count() throws DbException {
         if (!table.tableIsExist()) return 0;
 
-        DbModelSelector dmSelector = this.select("count(\"" + table.getId().getColumnName() + "\") as count");
+        DbModelSelector dmSelector = this.select("count(\"" + table.getId().getName() + "\") as count");
         DbModel firstModel = dmSelector.findFirst();
         if (firstModel != null) {
             return firstModel.getLong("count");
@@ -197,7 +197,7 @@ public final class Selector<T> {
         StringBuilder result = new StringBuilder();
         result.append("SELECT ");
         result.append("*");
-        result.append(" FROM ").append("\"").append(table.getTableName()).append("\"");
+        result.append(" FROM ").append("\"").append(table.getName()).append("\"");
         if (whereBuilder != null && whereBuilder.getWhereItemSize() > 0) {
             result.append(" WHERE ").append(whereBuilder.toString());
         }

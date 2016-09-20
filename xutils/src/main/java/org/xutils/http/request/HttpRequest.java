@@ -1,11 +1,14 @@
 package org.xutils.http.request;
 
+import android.annotation.TargetApi;
 import android.net.Uri;
+import android.os.Build;
 import android.text.TextUtils;
 
 import org.xutils.cache.DiskCacheEntity;
 import org.xutils.cache.LruDiskCache;
 import org.xutils.common.util.IOUtil;
+import org.xutils.common.util.KeyValue;
 import org.xutils.common.util.LogUtil;
 import org.xutils.ex.HttpException;
 import org.xutils.http.HttpMethod;
@@ -16,11 +19,15 @@ import org.xutils.http.cookie.DbCookieStore;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.lang.reflect.Field;
+import java.lang.reflect.Type;
 import java.net.CookieManager;
 import java.net.CookiePolicy;
 import java.net.HttpURLConnection;
+import java.net.ProtocolException;
 import java.net.Proxy;
 import java.net.URL;
+import java.net.URLDecoder;
 import java.text.SimpleDateFormat;
 import java.util.Date;
 import java.util.GregorianCalendar;
@@ -28,9 +35,11 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.StringTokenizer;
 import java.util.TimeZone;
 
 import javax.net.ssl.HttpsURLConnection;
+import javax.net.ssl.SSLSocketFactory;
 
 /**
  * Created by wyouflf on 15/7/23.
@@ -42,12 +51,13 @@ public class HttpRequest extends UriRequest {
     private boolean isLoading = false;
     private InputStream inputStream = null;
     private HttpURLConnection connection = null;
+    private int responseCode = 0;
 
     // cookie manager
     private static final CookieManager COOKIE_MANAGER =
             new CookieManager(DbCookieStore.INSTANCE, CookiePolicy.ACCEPT_ALL);
 
-    /*package*/ HttpRequest(RequestParams params, Class<?> loadType) throws Throwable {
+    /*package*/ HttpRequest(RequestParams params, Type loadType) throws Throwable {
         super(params, loadType);
     }
 
@@ -61,18 +71,23 @@ public class HttpRequest extends UriRequest {
         } else if (!uri.endsWith("?")) {
             queryBuilder.append("&");
         }
-        HashMap<String, String> queryParams = params.getQueryStringParams();
+        List<KeyValue> queryParams = params.getQueryStringParams();
         if (queryParams != null) {
-            for (Map.Entry<String, String> entry : queryParams.entrySet()) {
-                String name = entry.getKey();
-                String value = entry.getValue();
-                if (!TextUtils.isEmpty(name) && !TextUtils.isEmpty(value)) {
-                    queryBuilder.append(Uri.encode(name)).append("=").append(Uri.encode(value)).append("&");
+            for (KeyValue kv : queryParams) {
+                String name = kv.key;
+                String value = kv.getValueStr();
+                if (!TextUtils.isEmpty(name) && value != null) {
+                    queryBuilder.append(
+                            Uri.encode(name, params.getCharset()))
+                            .append("=")
+                            .append(Uri.encode(value, params.getCharset()))
+                            .append("&");
                 }
             }
-            if (queryBuilder.charAt(queryBuilder.length() - 1) == '&') {
-                queryBuilder.deleteCharAt(queryBuilder.length() - 1);
-            }
+        }
+
+        if (queryBuilder.charAt(queryBuilder.length() - 1) == '&') {
+            queryBuilder.deleteCharAt(queryBuilder.length() - 1);
         }
 
         if (queryBuilder.charAt(queryBuilder.length() - 1) == '?') {
@@ -99,8 +114,10 @@ public class HttpRequest extends UriRequest {
      * @throws IOException
      */
     @Override
-    public void sendRequest() throws IOException {
+    @TargetApi(Build.VERSION_CODES.KITKAT)
+    public void sendRequest() throws Throwable {
         isLoading = false;
+        responseCode = 0;
 
         URL url = new URL(queryUrl);
         { // init connection
@@ -110,16 +127,24 @@ public class HttpRequest extends UriRequest {
             } else {
                 connection = (HttpURLConnection) url.openConnection();
             }
-            connection.setInstanceFollowRedirects(true);
+
+            // try to fix bug: accidental EOFException before API 19
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.KITKAT) {
+                connection.setRequestProperty("Connection", "close");
+            }
+
             connection.setReadTimeout(params.getConnectTimeout());
             connection.setConnectTimeout(params.getConnectTimeout());
+            connection.setInstanceFollowRedirects(params.getRedirectHandler() == null);
             if (connection instanceof HttpsURLConnection) {
-                ((HttpsURLConnection) connection).setSSLSocketFactory(params.getSslSocketFactory());
+                SSLSocketFactory sslSocketFactory = params.getSslSocketFactory();
+                if (sslSocketFactory != null) {
+                    ((HttpsURLConnection) connection).setSSLSocketFactory(sslSocketFactory);
+                }
             }
         }
 
-        {// add headers
-
+        if (params.isUseCookie()) {// add cookies
             try {
                 Map<String, List<String>> singleMap =
                         COOKIE_MANAGER.get(url.toURI(), new HashMap<String, List<String>>(0));
@@ -130,23 +155,43 @@ public class HttpRequest extends UriRequest {
             } catch (Throwable ex) {
                 LogUtil.e(ex.getMessage(), ex);
             }
+        }
 
-            HashMap<String, String> headers = params.getHeaders();
+        {// add headers
+            List<RequestParams.Header> headers = params.getHeaders();
             if (headers != null) {
-                for (Map.Entry<String, String> entry : headers.entrySet()) {
-                    String name = entry.getKey();
-                    String value = entry.getValue();
+                for (RequestParams.Header header : headers) {
+                    String name = header.key;
+                    String value = header.getValueStr();
                     if (!TextUtils.isEmpty(name) && !TextUtils.isEmpty(value)) {
-                        connection.setRequestProperty(name, value);
+                        if (header.setHeader) {
+                            connection.setRequestProperty(name, value);
+                        } else {
+                            connection.addRequestProperty(name, value);
+                        }
                     }
                 }
             }
+        }
 
+        // intercept response
+        if (requestInterceptListener != null) {
+            requestInterceptListener.beforeRequest(this);
         }
 
         { // write body
             HttpMethod method = params.getMethod();
-            connection.setRequestMethod(method.toString());
+            try {
+                connection.setRequestMethod(method.toString());
+            } catch (ProtocolException ex) {
+                try { // fix: HttpURLConnection not support PATCH method.
+                    Field methodField = HttpURLConnection.class.getDeclaredField("method");
+                    methodField.setAccessible(true);
+                    methodField.set(connection, method.toString());
+                } catch (Throwable ignored) {
+                    throw ex;
+                }
+            }
             if (HttpMethod.permitsRequestBody(method)) {
                 RequestBody body = params.getRequestBody();
                 if (body != null) {
@@ -157,20 +202,26 @@ public class HttpRequest extends UriRequest {
                     if (!TextUtils.isEmpty(contentType)) {
                         connection.setRequestProperty("Content-Type", contentType);
                     }
-                    connection.setRequestProperty("Content-Length", String.valueOf(body.getContentLength()));
+                    long contentLength = body.getContentLength();
+                    if (contentLength < 0) {
+                        connection.setChunkedStreamingMode(256 * 1024);
+                    } else {
+                        if (contentLength < Integer.MAX_VALUE) {
+                            connection.setFixedLengthStreamingMode((int) contentLength);
+                        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT) {
+                            connection.setFixedLengthStreamingMode(contentLength);
+                        } else {
+                            connection.setChunkedStreamingMode(256 * 1024);
+                        }
+                    }
+                    connection.setRequestProperty("Content-Length", String.valueOf(contentLength));
                     connection.setDoOutput(true);
                     body.writeTo(connection.getOutputStream());
                 }
             }
         }
 
-        LogUtil.d(queryUrl);
-        int code = connection.getResponseCode();
-        if (code >= 300) {
-            throw new HttpException(code, connection.getResponseMessage());
-        }
-
-        { // save cookies
+        if (params.isUseCookie()) { // save cookies
             try {
                 Map<String, List<String>> headers = connection.getHeaderFields();
                 if (headers != null) {
@@ -179,6 +230,24 @@ public class HttpRequest extends UriRequest {
             } catch (Throwable ex) {
                 LogUtil.e(ex.getMessage(), ex);
             }
+        }
+
+        // check response code
+        responseCode = connection.getResponseCode();
+        // intercept response
+        if (requestInterceptListener != null) {
+            requestInterceptListener.afterRequest(this);
+        }
+        if (responseCode == 204 || responseCode == 205) { // empty content
+            throw new HttpException(responseCode, this.getResponseMessage());
+        } else if (responseCode >= 300) {
+            HttpException httpException = new HttpException(responseCode, this.getResponseMessage());
+            try {
+                httpException.setResult(IOUtil.readStr(this.getInputStream(), params.getCharset()));
+            } catch (Throwable ignored) {
+            }
+            LogUtil.e(httpException.toString() + ", url: " + queryUrl);
+            throw httpException;
         }
 
         isLoading = true;
@@ -196,7 +265,7 @@ public class HttpRequest extends UriRequest {
             cacheKey = params.getCacheKey();
 
             if (TextUtils.isEmpty(cacheKey)) {
-                cacheKey = queryUrl;
+                cacheKey = params.toString();
             }
         }
         return cacheKey;
@@ -217,17 +286,19 @@ public class HttpRequest extends UriRequest {
     @Override
     public Object loadResultFromCache() throws Throwable {
         isLoading = true;
-        DiskCacheEntity cacheEntity = LruDiskCache.getDiskCache(params.getCacheDirName()).get(this.getCacheKey());
+        DiskCacheEntity cacheEntity = LruDiskCache.getDiskCache(params.getCacheDirName())
+                .setMaxSize(params.getCacheSize())
+                .get(this.getCacheKey());
 
         if (cacheEntity != null) {
             if (HttpMethod.permitsCache(params.getMethod())) {
                 Date lastModified = cacheEntity.getLastModify();
                 if (lastModified.getTime() > 0) {
-                    params.addHeader("If-Modified-Since", toGMTString(lastModified));
+                    params.setHeader("If-Modified-Since", toGMTString(lastModified));
                 }
                 String eTag = cacheEntity.getEtag();
                 if (!TextUtils.isEmpty(eTag)) {
-                    params.addHeader("If-None-Match", eTag);
+                    params.setHeader("If-None-Match", eTag);
                 }
             }
             return loader.loadFromCache(cacheEntity);
@@ -238,14 +309,15 @@ public class HttpRequest extends UriRequest {
 
     @Override
     public void clearCacheHeader() {
-        params.addHeader("If-Modified-Since", null);
-        params.addHeader("If-None-Match", null);
+        params.setHeader("If-Modified-Since", null);
+        params.setHeader("If-None-Match", null);
     }
 
     @Override
     public InputStream getInputStream() throws IOException {
         if (connection != null && inputStream == null) {
-            inputStream = connection.getInputStream();
+            inputStream = connection.getResponseCode() >= 400 ?
+                    connection.getErrorStream() : connection.getInputStream();
         }
         return inputStream;
     }
@@ -258,7 +330,7 @@ public class HttpRequest extends UriRequest {
         }
         if (connection != null) {
             connection.disconnect();
-            connection = null;
+            //connection = null;
         }
     }
 
@@ -289,7 +361,7 @@ public class HttpRequest extends UriRequest {
     @Override
     public int getResponseCode() throws IOException {
         if (connection != null) {
-            return connection.getResponseCode();
+            return responseCode;
         } else {
             if (this.getInputStream() != null) {
                 return 200;
@@ -300,13 +372,57 @@ public class HttpRequest extends UriRequest {
     }
 
     @Override
-    public long getExpiration() {
-        if (connection == null) return -1;
-        long result = connection.getExpiration();
-        if (result <= 0) {
-            result = Long.MAX_VALUE;
+    public String getResponseMessage() throws IOException {
+        if (connection != null) {
+            return URLDecoder.decode(connection.getResponseMessage(), params.getCharset());
+        } else {
+            return null;
         }
-        return result;
+    }
+
+    @Override
+    public long getExpiration() {
+        if (connection == null) return -1L;
+
+        long expiration = -1L;
+
+        // from max-age
+        String cacheControl = connection.getHeaderField("Cache-Control");
+        if (!TextUtils.isEmpty(cacheControl)) {
+            StringTokenizer tok = new StringTokenizer(cacheControl, ",");
+            while (tok.hasMoreTokens()) {
+                String token = tok.nextToken().trim().toLowerCase();
+                if (token.startsWith("max-age")) {
+                    int eqIdx = token.indexOf('=');
+                    if (eqIdx > 0) {
+                        try {
+                            String value = token.substring(eqIdx + 1).trim();
+                            long seconds = Long.parseLong(value);
+                            if (seconds > 0L) {
+                                expiration = System.currentTimeMillis() + seconds * 1000L;
+                            }
+                        } catch (Throwable ex) {
+                            LogUtil.e(ex.getMessage(), ex);
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+
+        // from expires
+        if (expiration <= 0L) {
+            expiration = connection.getExpiration();
+        }
+
+        if (expiration <= 0L && params.getCacheMaxAge() > 0L) {
+            expiration = System.currentTimeMillis() + params.getCacheMaxAge();
+        }
+
+        if (expiration <= 0L) {
+            expiration = Long.MAX_VALUE;
+        }
+        return expiration;
     }
 
     @Override

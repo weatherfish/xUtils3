@@ -5,12 +5,12 @@ import org.xutils.cache.LruDiskCache;
 import org.xutils.common.util.IOUtil;
 import org.xutils.common.util.LogUtil;
 import org.xutils.http.RequestParams;
-import org.xutils.http.loader.InputStreamLoader;
 import org.xutils.x;
 
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
+import java.lang.reflect.Type;
 import java.util.Date;
 import java.util.List;
 import java.util.Map;
@@ -24,12 +24,12 @@ public class AssetsRequest extends UriRequest {
     private long contentLength = 0;
     private InputStream inputStream;
 
-    public AssetsRequest(RequestParams params, Class<?> loadType) throws Throwable {
+    public AssetsRequest(RequestParams params, Type loadType) throws Throwable {
         super(params, loadType);
     }
 
     @Override
-    public void sendRequest() throws IOException {
+    public void sendRequest() throws Throwable {
 
     }
 
@@ -45,15 +45,14 @@ public class AssetsRequest extends UriRequest {
 
     @Override
     public Object loadResult() throws Throwable {
-        if (loader instanceof InputStreamLoader) {
-            return getInputStream();
-        }
         return this.loader.load(this);
     }
 
     @Override
     public Object loadResultFromCache() throws Throwable {
-        DiskCacheEntity cacheEntity = LruDiskCache.getDiskCache(params.getCacheDirName()).get(this.getCacheKey());
+        DiskCacheEntity cacheEntity = LruDiskCache.getDiskCache(params.getCacheDirName())
+                .setMaxSize(params.getCacheSize())
+                .get(this.getCacheKey());
 
         if (cacheEntity != null) {
             Date lastModifiedDate = cacheEntity.getLastModify();
@@ -75,7 +74,7 @@ public class AssetsRequest extends UriRequest {
     public InputStream getInputStream() throws IOException {
         if (inputStream == null) {
             if (callingClassLoader != null) {
-                String assetsPath = "assets/" + queryUrl.substring(9);
+                String assetsPath = "assets/" + queryUrl.substring("assets://".length());
                 inputStream = callingClassLoader.getResourceAsStream(assetsPath);
                 contentLength = inputStream.available();
             }
@@ -103,6 +102,11 @@ public class AssetsRequest extends UriRequest {
     @Override
     public int getResponseCode() throws IOException {
         return getInputStream() != null ? 200 : 404;
+    }
+
+    @Override
+    public String getResponseMessage() throws IOException {
+        return null;
     }
 
     @Override

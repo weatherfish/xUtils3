@@ -11,7 +11,7 @@
 
 #### 使用Gradle构建时添加一下依赖即可:
 ```javascript
-compile 'org.xutils:xutils:3.3.42'
+compile 'org.xutils:xutils:3.3.44'
 ```
 ##### 如果使用eclipse可以 [点击这里下载aar文件](http://dl.bintray.com/wyouflf/maven/org/xutils/xutils/), 然后用zip解压, 取出jar包和so文件.
 ##### 混淆配置参考示例项目sample的配置
@@ -272,6 +272,7 @@ ____
 * webp来自:https://github.com/webmproject/libwebp
 * webpbackport来自:https://github.com/alexey-pelykh/webp-android-backport
 * xUtils在使用webpbackport时为其添加了nativeDecodeFile的实现, 并修复其在Android 5.0及以上系统存在bug:
+对webpbackport的修改已经合并至https://github.com/alexey-pelykh/webp-android-backport
 jni代码见: https://github.com/wyouflf/webp-android-backport/commits/master
 
 ----
